@@ -10,9 +10,12 @@
 //   {t:"rejoin", code, token}           bağlantı koptuktan sonra aynı yere geri dön
 //   {t:"relay", d:{...}}                rakibe ilet
 //   {t:"leave"}                         odadan çık
+//   {t:"quick", cfg:{...}}              hızlı eşleşme: rastgele bir rakip bekle (cfg: süre/varyant isteği)
+//   {t:"quick_cancel"}                  beklemeyi bırak
 //   {t:"ping"}
 // Sunucu -> istemci:
 //   {t:"created", code, token}  {t:"joined", code, token, cfg}  {t:"peer_joined"}
+//   {t:"waiting", n}  {t:"matched", code, token, role, cfg}   (hızlı eşleşme)
 //   {t:"peer_left"}  {t:"peer_back"}  {t:"rejoined", role}  {t:"msg", d}  {t:"error", reason}  {t:"pong"}
 
 const http = require("http");
@@ -26,6 +29,46 @@ const MAX_MSG = 8 * 1024;
 const MAX_ROOMS = 5000;
 
 const rooms = new Map(); // code -> {cfg, host:{ws,token}, guest:{ws,token}, empty_since}
+let queue = []; // hızlı eşleşme bekleyenler: [{ws, cfg, since}]
+
+function unqueue(ws) {
+  queue = queue.filter((q) => q.ws !== ws);
+}
+
+// Hızlı eşleşme: kuyrukta başka biri varsa ikisi için oda kurulur. Süre ve tür, önce bekleyenin
+// isteğine göre olur; renkler rastgele dağıtılır.
+function quickMatch(ws, cfg) {
+  unqueue(ws);
+  detach(ws, true);
+  queue = queue.filter((q) => q.ws.readyState === 1);
+  const mate = queue.shift();
+  if (!mate) {
+    queue.push({ ws, cfg: cfg || {}, since: Date.now() });
+    return send(ws, { t: "waiting", n: queue.length });
+  }
+  const code = newCode();
+  if (!code || rooms.size >= MAX_ROOMS) {
+    queue.unshift(mate);
+    return send(ws, { t: "error", reason: "full" });
+  }
+  const pref = mate.cfg || {};
+  const roomCfg = {
+    host_color: crypto.randomInt(2) === 0 ? 1 : -1,
+    minutes: Number(pref.minutes) || 0,
+    variant: String(pref.variant || ""),
+    seed: crypto.randomInt(1000000),
+    quick: true,
+  };
+  const ht = crypto.randomBytes(12).toString("hex");
+  const gt = crypto.randomBytes(12).toString("hex");
+  rooms.set(code, { cfg: roomCfg, host: { ws: mate.ws, token: ht }, guest: { ws, token: gt }, empty_since: 0 });
+  mate.ws.code = code;
+  mate.ws.role = "host";
+  ws.code = code;
+  ws.role = "guest";
+  send(mate.ws, { t: "matched", code, token: ht, role: "host", cfg: roomCfg });
+  send(ws, { t: "matched", code, token: gt, role: "guest", cfg: roomCfg });
+}
 
 function newCode() {
   for (let tries = 0; tries < 50; tries++) {
@@ -58,7 +101,7 @@ function detach(ws, notify) {
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("Cozy Chess relay calisiyor. Odalar: " + rooms.size + "\n");
+  res.end("Cozy Chess relay calisiyor. Odalar: " + rooms.size + " · Bekleyen: " + queue.length + "\n");
 });
 
 const wss = new WebSocketServer({ server, maxPayload: MAX_MSG });
@@ -130,7 +173,13 @@ wss.on("connection", (ws) => {
         if (o && o.ws) send(o.ws, { t: "msg", d: m.d });
         return;
       }
+      case "quick":
+        return quickMatch(ws, m.cfg);
+      case "quick_cancel":
+        unqueue(ws);
+        return;
       case "leave": {
+        unqueue(ws);
         const room = rooms.get(ws.code);
         if (room) {
           const o = other(room, ws.role);
@@ -144,7 +193,10 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => detach(ws, true));
+  ws.on("close", () => {
+    unqueue(ws);
+    detach(ws, true);
+  });
   ws.on("error", () => {});
 });
 
