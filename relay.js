@@ -189,6 +189,7 @@ async function handleCorr(ws, m) {
 //   {t:"camp_info", info}                  -> herkese {t:"camp_peer", seat, info, on:true}
 //   {t:"camp_kick", seat}                  (yalnız ev sahibi) -> atılana {t:"camp_kicked"}, diğerlerine {t:"camp_left", seat, kicked:true}
 //   {t:"camp_leave"}                       misafir: {t:"camp_left", seat}; ev sahibi: herkese {t:"camp_closed"}
+//                                          (oyun masasında kapanmaz: {t:"camp_host", from} ile yeni ev sahibi)
 //   {t:"camp_pub", pub|null}               (yalnız ev sahibi) Yardım Panosu'na as / indir
 //   {t:"camp_cfg", lim, open}             (yalnız ev sahibi) oyuncu sınırı (2-4) ve Açık Kamplar listesinde görünme
 //                                          (open: {nick, camp, lvl} | null)
@@ -241,10 +242,14 @@ function campDetach(ws, why) {
   const seat = ws.seat;
   const s = room.seats[seat];
   if (s && s.ws === ws) {
-    if (why === "leave") {
+    if (why === "leave" || why === "close") {
       if (seat === 0) {
-        campBroadcast(room, { t: "camp_closed" }, ws);
-        camps.delete(ws.camp);
+        room.seats[0] = null;
+        // masa: ev sahibi "kalkarsa" masa devredilir; "masayı topla" derse (close) herkes için kapanır
+        if (!(why === "leave" && room.kind === "table" && campPromote(room))) {
+          campBroadcast(room, { t: "camp_closed" }, ws);
+          camps.delete(ws.camp);
+        }
       } else {
         room.seats[seat] = null;
         campBroadcast(room, { t: "camp_left", seat });
@@ -257,6 +262,58 @@ function campDetach(ws, why) {
   }
   ws.camp = null;
   ws.seat = -1;
+}
+
+// Oyun masası: ev sahibi kalkınca / bağlantısı dönmeyince masa kapanmaz; bağlı ilk oyuncu yeni ev sahibi olur. Onun
+// koltuğu 0'a taşınır, herkese {t:"camp_host", from}. (Ortak kampta devir yok: kamp ev sahibinin kaydından kurulur.)
+function campPromote(room) {
+  const k = room.seats.findIndex((s, i) => i > 0 && s && s.ws);
+  if (k < 0) return false;
+  const s = room.seats[k];
+  room.seats[0] = s;
+  room.seats[k] = null;
+  s.ws.seat = 0;
+  room.pub = null;
+  room.open = null;
+  campBroadcast(room, { t: "camp_host", from: k });
+  return true;
+}
+
+// ---------------------------------------------------------------- hile / kötüye kullanım koruması
+// Misket hediyesi sunucudan geçer: yalnız 10 / 25 / 50 / 100, bir oyuncu (cid) günde en çok 1000 Misket gönderir.
+// Alıcı bağlıysa hediye iletilir ve gönderene hemen "ulaştı" denir ({t:"camp_gift", id, ok:true}); alıcı yoksa
+// ok:false (Misket geri döner). Böylece "aldım" demeyen değiştirilmiş bir oyunla Misket çoğaltılamaz.
+const GIFT_AMOUNTS = [10, 25, 50, 100];
+const GIFT_DAILY = 1000;
+const giftLog = new Map(); // cid -> {day, sent}
+function campGift(ws, room, m, d) {
+  const id = String(d.id || "").slice(0, 32);
+  const n = Number(d.n);
+  const to = Number(m.to);
+  if (!id || !GIFT_AMOUNTS.includes(n) || !Number.isInteger(to) || to === ws.seat) return;
+  const me = room.seats[ws.seat];
+  const key = me && me.cid ? me.cid : "s" + ws.seat + ":" + (ws.camp || "");
+  const day = Math.floor(Date.now() / 86400000);
+  let g = giftLog.get(key);
+  if (!g || g.day !== day) g = { day, sent: 0 };
+  if (g.sent + n > GIFT_DAILY) return send(ws, { t: "camp_gift", id, ok: false, why: "limit" });
+  const target = room.seats[to];
+  if (!target || !target.ws) return send(ws, { t: "camp_gift", id, ok: false, why: "gone" });
+  g.sent += n;
+  if (giftLog.size > 20000) giftLog.clear();
+  giftLog.set(key, g);
+  send(target.ws, { t: "camp_msg", from: ws.seat, d: { k: "gift", id, n } });
+  return send(ws, { t: "camp_gift", id, ok: true });
+}
+
+// Sohbet: satır en çok 200 harf, bir bağlantı 5 saniyede en çok 6 satır (sel / spam olmasın).
+function chatRate(ws, d) {
+  if (typeof d.t !== "string" || d.t.length > 200) return false;
+  const now = Date.now();
+  ws.chat_t = (ws.chat_t || []).filter((t) => now - t < 5000);
+  if (ws.chat_t.length >= 6) return false;
+  ws.chat_t.push(now);
+  return true;
 }
 
 function campRate(ws) {
@@ -282,7 +339,7 @@ function handleCamp(ws, m) {
       seats[0] = { ws, token, info: cleanInfo(m.info), cid: String(m.cid || ""), gone_at: 0 };
       // kind: "camp" (ortak kamp) ya da "table" (Arkadaşla Oyna'daki 3-4 kişilik oyun masası; kamp haritası yok)
       const kind = m.kind === "table" ? "table" : "camp";
-      camps.set(code, { seats, banned: new Map(), lim: CAMP_SEATS, open: null, kind, empty_since: 0 });
+      camps.set(code, { seats, banned: new Map(), lim: CAMP_SEATS, open: null, kind, v: Number(m.v) || 0, empty_since: 0 });
       ws.camp = code;
       ws.seat = 0;
       return send(ws, { t: "camp_created", code, token, seat: 0 });
@@ -291,6 +348,7 @@ function handleCamp(ws, m) {
       const code = String(m.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
       const room = camps.get(code);
       if (!room || !room.seats[0]) return send(ws, { t: "error", reason: "no_room" });
+      if ((Number(m.v) || 0) !== (room.v || 0)) return send(ws, { t: "error", reason: "version" });
       const cid = String(m.cid || "");
       if (cid && room.banned.has(cid)) {
         const left = room.banned.get(cid) - Date.now();
@@ -314,6 +372,7 @@ function handleCamp(ws, m) {
       const out = [];
       for (const [code, room] of camps) {
         if ((!room.pub && !room.open) || !room.seats[0] || !room.seats[0].ws) continue;
+        if ((Number(m.v) || 0) !== (room.v || 0)) continue; // başka sürümdeki kamplar listede görünmez
         const n = room.seats.filter((s) => s).length;
         if (n >= room.lim) continue;
         out.push({ code, pub: room.pub || null, open: room.open || null, n, lim: room.lim,
@@ -343,6 +402,9 @@ function handleCamp(ws, m) {
   switch (m.t) {
     case "camp_send": {
       if (!campRate(ws)) return;
+      const d = m.d && typeof m.d === "object" ? m.d : null;
+      if (d && d.k === "gift") return campGift(ws, room, m, d);
+      if (d && d.k === "chat" && !chatRate(ws, d)) return;
       const out = { t: "camp_msg", from: ws.seat, d: m.d };
       if (Number.isInteger(m.to)) {
         const s = room.seats[m.to];
@@ -389,7 +451,7 @@ function handleCamp(ws, m) {
       return campBroadcast(room, { t: "camp_left", seat: k, kicked: true });
     }
     case "camp_leave":
-      return campDetach(ws, "leave");
+      return campDetach(ws, m.close ? "close" : "leave");
   }
 }
 
@@ -401,13 +463,15 @@ function unqueue(ws) {
 
 // Hızlı eşleşme: kuyrukta başka biri varsa ikisi için oda kurulur. Süre ve tür, önce bekleyenin
 // isteğine göre olur; renkler rastgele dağıtılır.
-function quickMatch(ws, cfg) {
+function quickMatch(ws, cfg, v) {
   unqueue(ws);
   detach(ws, true);
   queue = queue.filter((q) => q.ws.readyState === 1);
-  const mate = queue.shift();
+  // yalnız aynı ağ sürümündekiler eşleşir (güncelleme sonrası eski / yeni sürüm karışmasın)
+  const mi = queue.findIndex((q) => q.v === v);
+  const mate = mi >= 0 ? queue.splice(mi, 1)[0] : null;
   if (!mate) {
-    queue.push({ ws, cfg: cfg || {}, since: Date.now() });
+    queue.push({ ws, cfg: cfg || {}, v, since: Date.now() });
     return send(ws, { t: "waiting", n: queue.length });
   }
   const code = newCode();
@@ -502,7 +566,7 @@ wss.on("connection", (ws) => {
         const code = newCode();
         if (!code) return send(ws, { t: "error", reason: "full" });
         const token = crypto.randomBytes(12).toString("hex");
-        rooms.set(code, { cfg: m.cfg || {}, host: { ws, token }, guest: null, empty_since: 0 });
+        rooms.set(code, { cfg: m.cfg || {}, v: Number(m.v) || 0, host: { ws, token }, guest: null, empty_since: 0 });
         ws.code = code;
         ws.role = "host";
         return send(ws, { t: "created", code, token });
@@ -511,6 +575,7 @@ wss.on("connection", (ws) => {
         const code = String(m.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
         const room = rooms.get(code);
         if (!room) return send(ws, { t: "error", reason: "no_room" });
+        if ((Number(m.v) || 0) !== (room.v || 0)) return send(ws, { t: "error", reason: "version" });
         if (room.guest) return send(ws, { t: "error", reason: "room_full" });
         detach(ws, true);
         const token = crypto.randomBytes(12).toString("hex");
@@ -547,7 +612,7 @@ wss.on("connection", (ws) => {
         return;
       }
       case "quick":
-        return quickMatch(ws, m.cfg);
+        return quickMatch(ws, m.cfg, Number(m.v) || 0);
       case "quick_cancel":
         unqueue(ws);
         return;
@@ -597,6 +662,8 @@ function campSweep(now) {
     room.seats.forEach((s, i) => {
       if (!camps.has(code) || !s || s.ws || !s.gone_at || now - s.gone_at < CAMP_GRACE_MS) return;
       if (i === 0) {
+        room.seats[0] = null;
+        if (room.kind === "table" && campPromote(room)) return; // masa: yeni ev sahibi
         campBroadcast(room, { t: "camp_closed" });
         for (const o of room.seats) if (o && o.ws) o.ws.camp = null;
         camps.delete(code);
