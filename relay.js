@@ -189,6 +189,8 @@ async function handleCorr(ws, m) {
 //   {t:"camp_info", info}                  -> herkese {t:"camp_peer", seat, info, on:true}
 //   {t:"camp_kick", seat}                  (yalnız ev sahibi) -> atılana {t:"camp_kicked"}, diğerlerine {t:"camp_left", seat, kicked:true}
 //   {t:"camp_leave"}                       misafir: {t:"camp_left", seat}; ev sahibi: herkese {t:"camp_closed"}
+//   {t:"camp_pub", pub|null}               (yalnız ev sahibi) Yardım Panosu'na as / indir
+//   {t:"camp_list"}                        -> {t:"camp_list", rooms:[{code, pub, n}]} (odada olmak gerekmez)
 // Bağlantısı kopan koltuk 90 sn tutulur ({t:"camp_peer", seat, on:false}); dönmezse boşalır. Ev sahibi dönmezse
 // kamp kapanır. Atılan oyuncu (cid) o kampa yeniden giremez.
 const CAMP_SEATS = 4;
@@ -297,6 +299,18 @@ function handleCamp(ws, m) {
       send(ws, { t: "camp_joined", code, token, seat: free, peers: campPeers(room) });
       return campBroadcast(room, { t: "camp_peer", seat: free, info: room.seats[free].info, on: true, fresh: true }, ws);
     }
+    case "camp_list": {
+      // Yardım Panosu: Kamp Yolu'nda yardım isteyen açık kamplar (en yeni 30)
+      const out = [];
+      for (const [code, room] of camps) {
+        if (!room.pub || !room.seats[0] || !room.seats[0].ws) continue;
+        const n = room.seats.filter((s) => s).length;
+        if (n >= CAMP_SEATS) continue;
+        out.push({ code, pub: room.pub, n, at: room.pub_at });
+      }
+      out.sort((a, b) => b.at - a.at);
+      return send(ws, { t: "camp_list", rooms: out.slice(0, 30).map(({ at, ...r }) => r) });
+    }
     case "camp_rejoin": {
       const room = camps.get(String(m.code || ""));
       if (!room) return send(ws, { t: "error", reason: "no_room" });
@@ -331,6 +345,13 @@ function handleCamp(ws, m) {
       if (!s) return;
       s.info = cleanInfo(m.info);
       return campBroadcast(room, { t: "camp_peer", seat: ws.seat, info: s.info, on: true }, ws);
+    }
+    case "camp_pub": {
+      // ev sahibi kampını Yardım Panosu'na asar (pub: {nick, level, char, mode}) ya da indirir (pub: null)
+      if (ws.seat !== 0) return;
+      room.pub = m.pub ? cleanInfo(m.pub) : null;
+      room.pub_at = Date.now();
+      return;
     }
     case "camp_kick": {
       if (ws.seat !== 0) return;
