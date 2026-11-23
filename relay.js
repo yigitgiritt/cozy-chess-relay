@@ -182,8 +182,8 @@ async function handleCorr(ws, m) {
 // ---------------------------------------------------------------- ortak kamp (en çok 4 kişi)
 // Kampı açan oyuncu (koltuk 0) ev sahibidir; kamp onun kaydından kurulur. Sunucu yalnızca koltukları tutar ve
 // mesajları taşır. Oda kodu 6 harftir (iki kişilik oyun odaları 5 harf), menüdeki aynı kutuya yazılabilir.
-//   {t:"camp_create", info}               -> {t:"camp_created", code, token, seat:0}
-//   {t:"camp_join", code, info, cid}       -> {t:"camp_joined", code, token, seat, peers:[{seat, info, on}]}
+//   {t:"camp_create", info, kind?}        -> {t:"camp_created", code, token, seat:0}   (kind "table": oyun masası)
+//   {t:"camp_join", code, info, cid}       -> {t:"camp_joined", code, token, seat, kind, peers:[{seat, info, on}]}
 //   {t:"camp_rejoin", code, token}         -> {t:"camp_rejoined", seat, peers}
 //   {t:"camp_send", d, to?}                -> diğerlerine (ya da yalnız "to" koltuğuna) {t:"camp_msg", from, d}
 //   {t:"camp_info", info}                  -> herkese {t:"camp_peer", seat, info, on:true}
@@ -280,7 +280,9 @@ function handleCamp(ws, m) {
       const token = crypto.randomBytes(12).toString("hex");
       const seats = new Array(CAMP_SEATS).fill(null);
       seats[0] = { ws, token, info: cleanInfo(m.info), cid: String(m.cid || ""), gone_at: 0 };
-      camps.set(code, { seats, banned: new Map(), lim: CAMP_SEATS, open: null, empty_since: 0 });
+      // kind: "camp" (ortak kamp) ya da "table" (Arkadaşla Oyna'daki 3-4 kişilik oyun masası; kamp haritası yok)
+      const kind = m.kind === "table" ? "table" : "camp";
+      camps.set(code, { seats, banned: new Map(), lim: CAMP_SEATS, open: null, kind, empty_since: 0 });
       ws.camp = code;
       ws.seat = 0;
       return send(ws, { t: "camp_created", code, token, seat: 0 });
@@ -304,7 +306,7 @@ function handleCamp(ws, m) {
       room.seats[free] = { ws, token, info: cleanInfo(m.info), cid, gone_at: 0 };
       ws.camp = code;
       ws.seat = free;
-      send(ws, { t: "camp_joined", code, token, seat: free, peers: campPeers(room) });
+      send(ws, { t: "camp_joined", code, token, seat: free, kind: room.kind || "camp", peers: campPeers(room) });
       return campBroadcast(room, { t: "camp_peer", seat: free, info: room.seats[free].info, on: true, fresh: true }, ws);
     }
     case "camp_list": {
