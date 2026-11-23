@@ -190,10 +190,13 @@ async function handleCorr(ws, m) {
 //   {t:"camp_kick", seat}                  (yalnız ev sahibi) -> atılana {t:"camp_kicked"}, diğerlerine {t:"camp_left", seat, kicked:true}
 //   {t:"camp_leave"}                       misafir: {t:"camp_left", seat}; ev sahibi: herkese {t:"camp_closed"}
 //   {t:"camp_pub", pub|null}               (yalnız ev sahibi) Yardım Panosu'na as / indir
-//   {t:"camp_list"}                        -> {t:"camp_list", rooms:[{code, pub, n}]} (odada olmak gerekmez)
+//   {t:"camp_cfg", lim, open}             (yalnız ev sahibi) oyuncu sınırı (2-4) ve Açık Kamplar listesinde görünme
+//                                          (open: {nick, camp, lvl} | null)
+//   {t:"camp_list"}                        -> {t:"camp_list", rooms:[{code, pub, open, n, lim}]} (odada olmak gerekmez)
 // Bağlantısı kopan koltuk 90 sn tutulur ({t:"camp_peer", seat, on:false}); dönmezse boşalır. Ev sahibi dönmezse
-// kamp kapanır. Atılan oyuncu (cid) o kampa yeniden giremez.
+// kamp kapanır. Atılan oyuncu (cid) o kampa 2 dakika giremez ({t:"error", reason:"banned", wait:sn}).
 const CAMP_SEATS = 4;
+const CAMP_BAN_MS = Number(process.env.CAMP_BAN_MS) || 2 * 60 * 1000; // (testler kısaltabilir)
 const CAMP_GRACE_MS = 90 * 1000;
 const CAMP_RATE = 80; // bir bağlantının saniyede en çok mesajı (konum + ses + sohbet)
 const camps = new Map(); // code -> {seats:[{ws, token, info, cid, gone_at}|null], banned:Set, empty_since}
@@ -277,7 +280,7 @@ function handleCamp(ws, m) {
       const token = crypto.randomBytes(12).toString("hex");
       const seats = new Array(CAMP_SEATS).fill(null);
       seats[0] = { ws, token, info: cleanInfo(m.info), cid: String(m.cid || ""), gone_at: 0 };
-      camps.set(code, { seats, banned: new Set(), empty_since: 0 });
+      camps.set(code, { seats, banned: new Map(), lim: CAMP_SEATS, open: null, empty_since: 0 });
       ws.camp = code;
       ws.seat = 0;
       return send(ws, { t: "camp_created", code, token, seat: 0 });
@@ -287,9 +290,14 @@ function handleCamp(ws, m) {
       const room = camps.get(code);
       if (!room || !room.seats[0]) return send(ws, { t: "error", reason: "no_room" });
       const cid = String(m.cid || "");
-      if (cid && room.banned.has(cid)) return send(ws, { t: "error", reason: "banned" });
+      if (cid && room.banned.has(cid)) {
+        const left = room.banned.get(cid) - Date.now();
+        if (left > 0) return send(ws, { t: "error", reason: "banned", wait: Math.ceil(left / 1000) });
+        room.banned.delete(cid);
+      }
       const free = room.seats.findIndex((s, i) => i > 0 && !s);
-      if (free < 0) return send(ws, { t: "error", reason: "room_full" });
+      const taken = room.seats.filter((s) => s).length;
+      if (free < 0 || taken >= room.lim) return send(ws, { t: "error", reason: "room_full", lim: room.lim });
       campDetach(ws, "leave");
       detach(ws, true);
       const token = crypto.randomBytes(12).toString("hex");
@@ -300,16 +308,17 @@ function handleCamp(ws, m) {
       return campBroadcast(room, { t: "camp_peer", seat: free, info: room.seats[free].info, on: true, fresh: true }, ws);
     }
     case "camp_list": {
-      // Yardım Panosu: Kamp Yolu'nda yardım isteyen açık kamplar (en yeni 30)
+      // Yardım Panosu (Kamp Yolu'nda yardım isteyenler) + Açık Kamplar (herkese açık kamplar); dolu olanlar yok, en yeni 40
       const out = [];
       for (const [code, room] of camps) {
-        if (!room.pub || !room.seats[0] || !room.seats[0].ws) continue;
+        if ((!room.pub && !room.open) || !room.seats[0] || !room.seats[0].ws) continue;
         const n = room.seats.filter((s) => s).length;
-        if (n >= CAMP_SEATS) continue;
-        out.push({ code, pub: room.pub, n, at: room.pub_at });
+        if (n >= room.lim) continue;
+        out.push({ code, pub: room.pub || null, open: room.open || null, n, lim: room.lim,
+          at: Math.max(room.pub ? room.pub_at || 0 : 0, room.open ? room.open_at || 0 : 0) });
       }
       out.sort((a, b) => b.at - a.at);
-      return send(ws, { t: "camp_list", rooms: out.slice(0, 30).map(({ at, ...r }) => r) });
+      return send(ws, { t: "camp_list", rooms: out.slice(0, 40).map(({ at, ...r }) => r) });
     }
     case "camp_rejoin": {
       const room = camps.get(String(m.code || ""));
@@ -353,12 +362,22 @@ function handleCamp(ws, m) {
       room.pub_at = Date.now();
       return;
     }
+    case "camp_cfg": {
+      // ev sahibi: oyuncu sınırı (2-4; içerideki kimse atılmaz, yalnız yeni giriş kapanır) ve Açık Kamplar
+      if (ws.seat !== 0) return;
+      const lim = Number(m.lim);
+      if (Number.isInteger(lim) && lim >= 2 && lim <= CAMP_SEATS) room.lim = lim;
+      const was = !!room.open;
+      room.open = m.open ? cleanInfo(m.open) : null;
+      if (room.open && !was) room.open_at = Date.now();
+      return;
+    }
     case "camp_kick": {
       if (ws.seat !== 0) return;
       const k = Number(m.seat);
       const s = room.seats[k];
       if (!(k > 0) || !s) return;
-      if (s.cid) room.banned.add(s.cid);
+      if (s.cid) room.banned.set(s.cid, Date.now() + CAMP_BAN_MS);
       room.seats[k] = null;
       if (s.ws) {
         send(s.ws, { t: "camp_kicked" });
