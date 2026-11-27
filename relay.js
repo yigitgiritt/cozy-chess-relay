@@ -229,8 +229,20 @@ function campPeers(room) {
   return out;
 }
 
+// Mesaj bir kez metne çevrilir, herkese aynısı gider (4 kişilik kampta 3 kez çevirmek sunucuyu boşuna yoruyordu).
+// İnterneti yavaş birinin kuyruğu çok dolarsa ona giden anlık mesajlar (konum, ses) atlanır: sunucunun belleği şişmesin,
+// o oyuncu da birikmiş eski konumları sonradan topluca almasın.
+const SLOW_BUFFER = 512 * 1024;
+
 function campBroadcast(room, obj, except) {
-  for (const s of room.seats) if (s && s.ws && s.ws !== except) send(s.ws, obj);
+  let txt = null;
+  const live = obj.t === "camp_msg" && obj.d && (obj.d.k === "st" || obj.d.k === "vo");
+  for (const s of room.seats) {
+    if (!s || !s.ws || s.ws === except || s.ws.readyState !== 1) continue;
+    if (live && s.ws.bufferedAmount > SLOW_BUFFER) continue;
+    if (txt === null) txt = JSON.stringify(obj);
+    s.ws.send(txt);
+  }
 }
 
 function campDetach(ws, why) {
